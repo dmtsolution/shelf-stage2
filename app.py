@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import cv2
-cv2.setNumThreads(0)  # 🔥 FIX crash OpenCV cloud
 import numpy as np
 from PIL import Image
 import timm
@@ -11,11 +10,6 @@ import os
 import time
 import pandas as pd
 import json
-
-# Grad-CAM
-from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
 
 # ==============================
 # CONFIG
@@ -33,7 +27,7 @@ CSV_PATH = os.path.join(BASE_DIR, "sku_catalog.csv")
 MAPPING_PATH = os.path.join(BASE_DIR, "idx_to_class.json")
 
 # ==============================
-# TRANSFORM
+# TRANSFORM (KAGGLE EXACT)
 # ==============================
 def get_transform():
     return transforms.Compose([
@@ -44,24 +38,15 @@ def get_transform():
     ])
 
 # ==============================
-# LOAD MODEL
+# LOADS
 # ==============================
 @st.cache_resource
 def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = timm.create_model(
-        MODEL_NAME,
-        pretrained=False,
-        num_classes=NUM_CLASSES
-    )
-
-    state_dict = torch.load(MODEL_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-
+    model = timm.create_model(MODEL_NAME, pretrained=False, num_classes=NUM_CLASSES)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.to(device)
     model.eval()
-
     return model, device
 
 @st.cache_data
@@ -75,80 +60,18 @@ def load_csv():
     return df.set_index("sku_id").to_dict("index")
 
 # ==============================
-# GRAD-CAM
+# PREDICTION
 # ==============================
-@st.cache_resource
-def get_cam_model(_model, device, use_plusplus=True, target_layer_name="blocks[-1]"):
-
-    if target_layer_name == "conv_head":
-        target_layers = [_model.conv_head]
-    else:
-        idx = int(target_layer_name.strip("blocks[]"))
-        target_layers = [_model.blocks[idx]]
-
-    if use_plusplus:
-        cam = GradCAMPlusPlus(
-            model=_model,
-            target_layers=target_layers,
-            use_cuda=torch.cuda.is_available()
-        )
-    else:
-        cam = GradCAM(
-            model=_model,
-            target_layers=target_layers,
-            use_cuda=torch.cuda.is_available()
-        )
-
-    return cam, target_layer_name
-
-# ==============================
-# HEATMAP HIGH CONTRAST
-# ==============================
-def create_high_contrast_cam(visualization, intensity=0.85, threshold=0.35):
-
-    gray = cv2.cvtColor(visualization, cv2.COLOR_RGB2GRAY)
-
-    gray = gray.astype(np.float32) / 255.0
-    gray = np.clip((gray - threshold) / (1 - threshold), 0, 1)
-
-    gray = np.power(gray, 0.6)
-
-    heatmap = cv2.applyColorMap((gray * 255).astype(np.uint8), cv2.COLORMAP_HOT)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-
-    result = (visualization * (1 - intensity) + heatmap * intensity).astype(np.uint8)
-
-    return result
-
-# ==============================
-# PREDICTION + GRADCAM
-# ==============================
-def predict_and_explain(model, image, transform, device, cam, top_k=5, intensity=0.85, threshold=0.35):
-
-    input_tensor = transform(image).unsqueeze(0).to(device)
-
+def predict(model, image, transform, device, top_k=5):
+    tensor = transform(image).unsqueeze(0).to(device)
     with torch.no_grad():
-        outputs = model(input_tensor)
+        outputs = model(tensor)
         probs = F.softmax(outputs, dim=1)[0]
         topk = probs.topk(top_k)
-
-    idxs = topk.indices.cpu().numpy()
-    probs_values = topk.values.cpu().numpy()
-
-    best_idx = int(idxs[0])
-    targets = [ClassifierOutputTarget(best_idx)]
-
-    grayscale_cam = cam(input_tensor=input_tensor, targets=targets)[0]
-
-    rgb_img = np.array(image.resize((IMG_SIZE, IMG_SIZE))).astype(np.float32) / 255.0
-    base_cam = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-
-    high_contrast_cam = create_high_contrast_cam(base_cam, intensity, threshold)
-
-    return idxs, probs_values, high_contrast_cam, best_idx, float(probs_values[0])
+    return topk.indices.cpu().numpy(), topk.values.cpu().numpy()
 
 # ==============================
-# DRAW RESULT
+# DRAW RESULT (STYLE STAGE 1)
 # ==============================
 def draw_result(image_np, label, conf):
     img = image_np.copy()
@@ -171,102 +94,77 @@ def draw_result(image_np, label, conf):
 # ==============================
 # UI
 # ==============================
-st.set_page_config(page_title="SKU Recognition PRO + XAI", layout="wide")
-st.title("🛒 Shelf Recognition — Grad-CAM High Contrast")
+st.set_page_config(page_title="SKU Recognition PRO", layout="wide")
+st.title("🛒 Shelf Recognition — Stage 2 (SKU)")
 
 model, device = load_model()
 mapping = load_mapping()
 sku_info = load_csv()
 transform = get_transform()
 
-st.success("✅ Modèle chargé + Grad-CAM activé")
+st.success("✅ Modèle chargé (MobileNetV3-Small)")
 
 # Sidebar
 with st.sidebar:
-    st.header("⚙️ Configuration")
-
+    st.header("⚙️ Config")
     top_k = st.slider("Top-K", 1, 10, 5)
+    conf_threshold = st.slider("Seuil confiance", 0.1, 0.9, 0.3)
 
-    cam_type = st.radio("Méthode", ["Grad-CAM++", "Grad-CAM"], horizontal=True)
-
-    layer_option = st.selectbox(
-        "Couche cible",
-        ["blocks[-1] (recommandé)", "blocks[-2]", "conv_head"],
-        index=0
-    )
-
-    show_gradcam = st.checkbox("Afficher heatmap", True)
-
-    st.subheader("🎨 Heatmap")
-    intensity = st.slider("Intensité", 0.6, 0.95, 0.85, 0.01)
-    threshold = st.slider("Seuil", 0.2, 0.6, 0.35, 0.01)
-
-layer_map = {
-    "blocks[-1] (recommandé)": "blocks[-1]",
-    "blocks[-2]": "blocks[-2]",
-    "conv_head": "conv_head"
-}
-
-cam, used_layer = get_cam_model(
-    model,
-    device,
-    use_plusplus=(cam_type == "Grad-CAM++"),
-    target_layer_name=layer_map[layer_option]
-)
-
-mode = st.radio("Mode", ["📷 Upload Image", "🎥 Webcam"], horizontal=True)
+# Mode
+mode = st.radio("Mode", ["📷 Upload", "🎥 Webcam"], horizontal=True)
 
 # ==============================
-# UPLOAD
+# IMAGE MODE
 # ==============================
-if mode == "📷 Upload Image":
-
-    uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png"])
+if mode == "📷 Upload":
+    uploaded = st.file_uploader("Upload image", type=["jpg","png","jpeg"])
 
     if uploaded:
         image = Image.open(uploaded).convert("RGB")
-        image_np = np.array(image).astype(np.uint8)
+        image_np = np.array(image)
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
 
         with col1:
             st.image(image, use_container_width=True)
 
-        with st.spinner("Analyse..."):
+        with st.spinner("🔍 Analyse..."):
             t0 = time.time()
-
-            idxs, probs, gradcam_viz, best_idx, best_prob = predict_and_explain(
-                model, image, transform, device, cam, top_k, intensity, threshold
-            )
-
+            idxs, probs = predict(model, image, transform, device, top_k)
             latency = (time.time() - t0) * 1000
 
-        sku = mapping.get(best_idx, "Inconnu")
+        best_idx = int(idxs[0])
+        best_prob = float(probs[0])
+        sku = mapping[best_idx]
+
+        img_draw = draw_result(image_np, sku, best_prob)
 
         with col2:
-            st.image(draw_result(image_np, sku, best_prob), use_container_width=True)
+            st.image(img_draw, use_container_width=True)
 
-        if show_gradcam:
-            with col3:
-                st.image(gradcam_viz, use_container_width=True)
-
+        # Metrics
         st.divider()
-
         c1, c2, c3 = st.columns(3)
         c1.metric("🎯 SKU", sku)
         c2.metric("📊 Confiance", f"{best_prob:.2%}")
         c3.metric("⚡ Latence", f"{latency:.1f} ms")
 
+        # Infos produit
+        info = sku_info.get(sku, {})
+        if info:
+            st.subheader("📦 Infos produit")
+            st.write(info)
+
+        # Top-K
         st.subheader("🔝 Top prédictions")
         for i, (idx, prob) in enumerate(zip(idxs, probs)):
-            st.write(f"{i+1}. {mapping.get(int(idx),'?')} → {prob:.2%}")
+            st.write(f"{i+1}. {mapping[int(idx)]} → {prob:.2%}")
 
 # ==============================
-# WEBCAM
+# WEBCAM MODE
 # ==============================
 elif mode == "🎥 Webcam":
-
-    st.info("📹 Webcam active")
+    st.info("📹 Webcam en temps réel")
 
     cap = cv2.VideoCapture(0)
     frame_placeholder = st.empty()
@@ -280,21 +178,15 @@ elif mode == "🎥 Webcam":
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(frame_rgb)
 
-        idxs, probs, gradcam_viz, best_idx, best_prob = predict_and_explain(
-            model, pil, transform, device, cam, top_k, intensity, threshold
-        )
+        idxs, probs = predict(model, pil, transform, device, top_k)
 
-        sku = mapping.get(best_idx, "Inconnu")
+        best_idx = int(idxs[0])
+        best_prob = float(probs[0])
+        sku = mapping[best_idx]
 
         frame_out = draw_result(frame_rgb, sku, best_prob)
 
-        if show_gradcam:
-            h, w = frame_out.shape[:2]
-            gradcam_resized = cv2.resize(gradcam_viz, (w, h))
-            combined = np.hstack((frame_out, gradcam_resized))
-            frame_placeholder.image(combined, use_container_width=True)
-        else:
-            frame_placeholder.image(frame_out, use_container_width=True)
+        frame_placeholder.image(frame_out, use_container_width=True)
 
     cap.release()
     st.success("Caméra arrêtée")
