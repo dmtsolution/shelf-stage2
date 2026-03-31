@@ -109,7 +109,7 @@ def predict_and_explain(model, image, transform, device, cam, top_k=5):
     return idxs, probs_values, create_high_contrast_cam(base_cam), best_idx, float(probs_values[0])
 
 # ==============================
-# DRAW RESULT (Style original)
+# DRAW RESULT (Style original conservé)
 # ==============================
 def draw_result(image_np, label, conf):
     img = image_np.copy()
@@ -141,9 +141,8 @@ sku_info = load_csv()
 transform = get_transform()
 cam = get_cam_model(model, device)
 
-st.success("✅ Modèle chargé | Grad-CAM Sharp activé")
+st.success("✅ Modèle MobileNetV3-Small chargé | Grad-CAM Sharp activé")
 
-# Sidebar
 with st.sidebar:
     st.header("⚙️ Configuration")
     top_k = st.slider("Top-K", 1, 10, 5)
@@ -178,7 +177,7 @@ if mode == "📷 Upload Image":
 
         if show_gradcam:
             with col3:
-                st.image(gradcam_viz, caption="Grad-CAM Sharp", use_container_width=True)
+                st.image(gradcam_viz, caption="Grad-CAM Sharp (Rouge vif)", use_container_width=True)
 
         st.divider()
         c1, c2, c3 = st.columns(3)
