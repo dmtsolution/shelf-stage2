@@ -69,24 +69,22 @@ def load_csv():
 # ==============================
 @st.cache_resource
 def get_cam_model(_model, device):
-    # Target layer pour MobileNetV3-small
     target_layers = [_model.blocks[-1]]
-    
     cam = GradCAMPlusPlus(model=_model, target_layers=target_layers)
     return cam
 
-def create_high_contrast_cam(visualization, intensity=0.85, threshold=0.35):
-    """Heatmap très contrasté : rouge vif sur zones importantes"""
+def create_high_contrast_cam(visualization):
+    """Heatmap très contrasté : rouge/orange vif + zones faibles supprimées"""
     gray = cv2.cvtColor(visualization, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
     
-    # Seuil + renforcement
-    gray = np.clip((gray - threshold) / (1.0 - threshold + 1e-8), 0, 1)
-    gray = np.power(gray, 1.8)                    # plus agressif
+    gray = np.clip((gray - 0.35) / (0.65 + 1e-8), 0, 1)
+    gray = np.power(gray, 1.8)
     
     heatmap = cv2.applyColorMap((gray * 255).astype(np.uint8), cv2.COLORMAP_HOT)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     
-    result = (visualization * (1 - intensity) + heatmap * intensity).astype(np.uint8)
+    # Superposition forte
+    result = (visualization * 0.15 + heatmap * 0.85).astype(np.uint8)
     return result
 
 # ==============================
@@ -116,20 +114,23 @@ def predict_and_explain(model, image, transform, device, cam, top_k=5):
     return idxs, probs_values, sharp_cam, best_idx, float(probs_values[0])
 
 # ==============================
-# DRAW RESULT
+# DRAW RESULT (Style original conservé)
 # ==============================
 def draw_result(image_np, label, conf):
     img = image_np.copy()
     h, w = img.shape[:2]
-    color = (0, 255, 0)
 
+    color = (0, 255, 0)
     cv2.rectangle(img, (20, 20), (w-20, h-20), color, 6)
 
     text = f"{label} {conf:.2f}"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+
     cv2.rectangle(img, (30, 30), (30 + tw + 20, 30 + th + 20), color, -1)
-    cv2.putText(img, text, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 4)
-    cv2.putText(img, text, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2)
+    cv2.putText(img, text, (40, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 4)
+    cv2.putText(img, text, (40, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2)
 
     return img
 
@@ -151,11 +152,14 @@ st.success("✅ Modèle MobileNetV3-Small chargé | Grad-CAM Sharp activé")
 with st.sidebar:
     st.header("⚙️ Configuration")
     top_k = st.slider("Top-K", 1, 10, 5)
-    show_gradcam = st.checkbox("Afficher Grad-CAM Sharp", value=True)
+    show_gradcam = st.checkbox("Afficher Grad-CAM Sharp (rouge vif)", value=True)
 
+# Mode
 mode = st.radio("Mode", ["📷 Upload Image", "🎥 Webcam"], horizontal=True)
 
-# ====================== UPLOAD ======================
+# ==============================
+# IMAGE MODE (Upload) - Style original conservé
+# ==============================
 if mode == "📷 Upload Image":
     uploaded = st.file_uploader("Upload image", type=["jpg","png","jpeg"])
 
@@ -168,7 +172,7 @@ if mode == "📷 Upload Image":
         with col1:
             st.image(image, caption="Image originale", use_container_width=True)
 
-        with st.spinner("Analyse + Grad-CAM Sharp..."):
+        with st.spinner("🔍 Analyse + Grad-CAM Sharp..."):
             t0 = time.time()
             idxs, probs, gradcam_viz, best_idx, best_prob = predict_and_explain(
                 model, image, transform, device, cam, top_k
@@ -177,30 +181,38 @@ if mode == "📷 Upload Image":
 
         sku = mapping.get(best_idx, "Inconnu")
 
+        img_draw = draw_result(image_np, sku, best_prob)
+
         with col2:
-            st.image(draw_result(image_np, sku, best_prob), caption="Prédiction", use_container_width=True)
+            st.image(img_draw, caption="Prédiction", use_container_width=True)
 
         if show_gradcam:
             with col3:
-                st.image(gradcam_viz, caption="Grad-CAM Sharp (Rouge vif sur zones importantes)", use_container_width=True)
+                st.image(gradcam_viz, caption="Grad-CAM Sharp — Zones importantes en rouge vif", 
+                        use_container_width=True)
 
+        # Metrics
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("🎯 SKU", sku)
         c2.metric("📊 Confiance", f"{best_prob:.2%}")
         c3.metric("⚡ Latence", f"{latency:.1f} ms")
 
+        # Infos produit
         info = sku_info.get(sku, {})
         if info:
             st.subheader("📦 Infos produit")
             st.write(info)
 
+        # Top-K
         st.subheader("🔝 Top prédictions")
         for i, (idx, prob) in enumerate(zip(idxs, probs)):
             label = mapping.get(int(idx), "Inconnu")
             st.write(f"{i+1}. {label} → {prob:.2%}")
 
-# ====================== WEBCAM ======================
+# ==============================
+# WEBCAM MODE
+# ==============================
 elif mode == "🎥 Webcam":
     st.info("📹 Webcam en temps réel")
 
@@ -231,7 +243,9 @@ elif mode == "🎥 Webcam":
                                    caption=f"Prédiction: {sku} | Grad-CAM Sharp", 
                                    use_container_width=True)
         else:
-            frame_placeholder.image(frame_out, channels="RGB", caption=sku, use_container_width=True)
+            frame_placeholder.image(frame_out, channels="RGB", 
+                                   caption=f"Prédiction: {sku}", 
+                                   use_container_width=True)
 
     cap.release()
     st.success("Caméra arrêtée")
