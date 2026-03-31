@@ -65,7 +65,7 @@ def load_csv():
     return df.set_index("sku_id").to_dict("index")
 
 # ==============================
-# GRAD-CAM HIGH CONTRAST
+# GRAD-CAM HIGH CONTRAST (Sharp Red)
 # ==============================
 @st.cache_resource
 def get_cam_model(_model, device):
@@ -109,7 +109,7 @@ def predict_and_explain(model, image, transform, device, cam, top_k=5):
     return idxs, probs_values, create_high_contrast_cam(base_cam), best_idx, float(probs_values[0])
 
 # ==============================
-# DRAW RESULT (ton style original)
+# DRAW RESULT (style original conservé)
 # ==============================
 def draw_result(image_np, label, conf):
     img = image_np.copy()
@@ -177,7 +177,7 @@ if mode == "📷 Upload Image":
 
         if show_gradcam:
             with col3:
-                st.image(gradcam_viz, caption="Grad-CAM Sharp (Rouge vif sur zones importantes)", use_container_width=True)
+                st.image(gradcam_viz, caption="Grad-CAM Sharp (Rouge vif)", use_container_width=True)
 
         st.divider()
         c1, c2, c3 = st.columns(3)
