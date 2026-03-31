@@ -11,6 +11,11 @@ import time
 import pandas as pd
 import json
 
+# Grad-CAM
+from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
 # ==============================
 # CONFIG
 # ==============================
@@ -27,7 +32,7 @@ CSV_PATH = os.path.join(BASE_DIR, "sku_catalog.csv")
 MAPPING_PATH = os.path.join(BASE_DIR, "idx_to_class.json")
 
 # ==============================
-# TRANSFORM (KAGGLE EXACT)
+# TRANSFORM
 # ==============================
 def get_transform():
     return transforms.Compose([
@@ -60,133 +65,213 @@ def load_csv():
     return df.set_index("sku_id").to_dict("index")
 
 # ==============================
-# PREDICTION
+# GRAD-CAM + CONTRASTE FORT
 # ==============================
-def predict(model, image, transform, device, top_k=5):
-    tensor = transform(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        outputs = model(tensor)
-        probs = F.softmax(outputs, dim=1)[0]
-        topk = probs.topk(top_k)
-    return topk.indices.cpu().numpy(), topk.values.cpu().numpy()
+@st.cache_resource
+def get_cam_model(_model, device, use_plusplus=True, target_layer_name="blocks[-1]"):
+    if target_layer_name == "conv_head":
+        target_layers = [_model.conv_head]
+    else:  # blocks[-1] ou blocks[-2]
+        idx = int(target_layer_name.strip("blocks[]"))
+        target_layers = [_model.blocks[idx]]
+
+    if use_plusplus:
+        cam = GradCAMPlusPlus(model=_model, target_layers=target_layers)
+    else:
+        cam = GradCAM(model=_model, target_layers=target_layers)
+    
+    return cam, target_layer_name
+
+# === NOUVELLE FONCTION : Heatmap très contrasté (ce que tu veux) ===
+def create_high_contrast_cam(visualization, intensity=0.85, threshold=0.4):
+    """
+    Crée un heatmap où :
+    - Zones importantes = rouge/orange très vif
+    - Zones non importantes = presque transparentes ou noires
+    """
+    # Convertir en grayscale
+    gray = cv2.cvtColor(visualization, cv2.COLOR_RGB2GRAY)
+    
+    # Normalisation forte + seuil
+    gray = gray.astype(np.float32) / 255.0
+    gray = np.clip((gray - threshold) / (1 - threshold), 0, 1)  # seuil
+    
+    # Augmenter le contraste
+    gray = np.power(gray, 0.6)  # rend les zones fortes encore plus fortes
+    
+    # Appliquer colormap JET ou HOT (plus rouge)
+    heatmap = cv2.applyColorMap((gray * 255).astype(np.uint8), cv2.COLORMAP_HOT)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    
+    # Superposition avec forte intensité sur les zones chaudes seulement
+    result = (visualization * (1 - intensity) + heatmap * intensity).astype(np.uint8)
+    
+    return result
 
 # ==============================
-# DRAW RESULT (STYLE STAGE 1)
+# PREDICTION + EXPLICABILITÉ
+# ==============================
+def predict_and_explain(model, image, transform, device, cam, top_k=5):
+    input_tensor = transform(image).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        outputs = model(input_tensor)
+        probs = F.softmax(outputs, dim=1)[0]
+        topk = probs.topk(top_k)
+    
+    idxs = topk.indices.cpu().numpy()
+    probs_values = topk.values.cpu().numpy()
+
+    best_idx = int(idxs[0])
+    targets = [ClassifierOutputTarget(best_idx)]
+    
+    grayscale_cam = cam(input_tensor=input_tensor, targets=targets)[0]
+
+    rgb_img = np.array(image.resize((IMG_SIZE, IMG_SIZE))) / 255.0
+    base_cam = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
+    
+    # Appliquer le contraste fort
+    high_contrast_cam = create_high_contrast_cam(base_cam, intensity=0.85, threshold=0.35)
+
+    return idxs, probs_values, high_contrast_cam, best_idx, float(probs_values[0])
+
+# ==============================
+# DRAW RESULT
 # ==============================
 def draw_result(image_np, label, conf):
     img = image_np.copy()
     h, w = img.shape[:2]
-
     color = (0, 255, 0)
     cv2.rectangle(img, (20, 20), (w-20, h-20), color, 6)
 
     text = f"{label} {conf:.2f}"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-
     cv2.rectangle(img, (30, 30), (30 + tw + 20, 30 + th + 20), color, -1)
-    cv2.putText(img, text, (40, 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 4)
-    cv2.putText(img, text, (40, 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2)
-
+    cv2.putText(img, text, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,0), 4)
+    cv2.putText(img, text, (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 2)
     return img
 
 # ==============================
 # UI
 # ==============================
-st.set_page_config(page_title="SKU Recognition PRO", layout="wide")
-st.title("🛒 Shelf Recognition — Stage 2 (SKU)")
+st.set_page_config(page_title="SKU Recognition PRO + XAI", layout="wide")
+st.title("🛒 Shelf Recognition — Stage 2 (SKU) + Explicabilité Grad-CAM")
 
 model, device = load_model()
 mapping = load_mapping()
 sku_info = load_csv()
 transform = get_transform()
 
-st.success("✅ Modèle chargé (MobileNetV3-Small)")
+st.success("✅ Modèle chargé | Heatmap High-Contrast activé")
 
-# Sidebar
 with st.sidebar:
-    st.header("⚙️ Config")
+    st.header("⚙️ Configuration")
     top_k = st.slider("Top-K", 1, 10, 5)
-    conf_threshold = st.slider("Seuil confiance", 0.1, 0.9, 0.3)
+    
+    cam_type = st.radio("Méthode", ["Grad-CAM++", "Grad-CAM"], horizontal=True)
+    layer_option = st.selectbox(
+        "Couche cible",
+        ["blocks[-1] (recommandé)", "blocks[-2]", "conv_head"],
+        index=0
+    )
+    show_gradcam = st.checkbox("Afficher le heatmap", value=True)
+    
+    # Contrôles du contraste
+    st.subheader("🎨 Contraste Heatmap")
+    intensity = st.slider("Intensité des zones chaudes", 0.6, 0.95, 0.85, 0.01)
+    threshold = st.slider("Seuil (supprimer zones faibles)", 0.2, 0.6, 0.35, 0.01)
 
-# Mode
-mode = st.radio("Mode", ["📷 Upload", "🎥 Webcam"], horizontal=True)
+# Mapping layer
+layer_map = {
+    "blocks[-1] (recommandé)": "blocks[-1]",
+    "blocks[-2]": "blocks[-2]",
+    "conv_head": "conv_head"
+}
 
-# ==============================
-# IMAGE MODE
-# ==============================
-if mode == "📷 Upload":
-    uploaded = st.file_uploader("Upload image", type=["jpg","png","jpeg"])
+cam, used_layer = get_cam_model(
+    model, 
+    device, 
+    use_plusplus=(cam_type == "Grad-CAM++"),
+    target_layer_name=layer_map[layer_option]
+)
+
+mode = st.radio("Mode", ["📷 Upload Image", "🎥 Webcam"], horizontal=True)
+
+# ====================== UPLOAD ======================
+if mode == "📷 Upload Image":
+    uploaded = st.file_uploader("Choisir une image", type=["jpg", "jpeg", "png"])
 
     if uploaded:
         image = Image.open(uploaded).convert("RGB")
         image_np = np.array(image)
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.image(image, use_container_width=True)
+            st.image(image, caption="Image originale", use_container_width=True)
 
-        with st.spinner("🔍 Analyse..."):
+        with st.spinner("Analyse + High Contrast Grad-CAM..."):
             t0 = time.time()
-            idxs, probs = predict(model, image, transform, device, top_k)
+            idxs, probs, gradcam_viz, best_idx, best_prob = predict_and_explain(
+                model, image, transform, device, cam, top_k
+            )
             latency = (time.time() - t0) * 1000
 
-        best_idx = int(idxs[0])
-        best_prob = float(probs[0])
-        sku = mapping[best_idx]
-
-        img_draw = draw_result(image_np, sku, best_prob)
+        sku = mapping.get(best_idx, "Inconnu")
 
         with col2:
-            st.image(img_draw, use_container_width=True)
+            st.image(draw_result(image_np, sku, best_prob), 
+                    caption="Prédiction", use_container_width=True)
 
-        # Metrics
+        if show_gradcam:
+            with col3:
+                st.image(gradcam_viz, 
+                        caption=f"{cam_type} | Layer: {used_layer} | High Contrast", 
+                        use_container_width=True)
+
         st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("🎯 SKU", sku)
         c2.metric("📊 Confiance", f"{best_prob:.2%}")
         c3.metric("⚡ Latence", f"{latency:.1f} ms")
 
-        # Infos produit
-        info = sku_info.get(sku, {})
-        if info:
-            st.subheader("📦 Infos produit")
-            st.write(info)
-
-        # Top-K
         st.subheader("🔝 Top prédictions")
         for i, (idx, prob) in enumerate(zip(idxs, probs)):
-            st.write(f"{i+1}. {mapping[int(idx)]} → {prob:.2%}")
+            label = mapping.get(int(idx), "Inconnu")
+            st.write(f"{i+1}. **{label}** → {prob:.2%}")
 
-# ==============================
-# WEBCAM MODE
-# ==============================
+# ====================== WEBCAM ======================
 elif mode == "🎥 Webcam":
-    st.info("📹 Webcam en temps réel")
-
+    st.info("📹 Webcam en temps réel - High Contrast")
     cap = cv2.VideoCapture(0)
     frame_placeholder = st.empty()
-    stop = st.button("⏹️ Stop")
+    stop_btn = st.button("⏹️ Arrêter")
 
-    while not stop:
+    while not stop_btn:
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(frame_rgb)
+        pil_image = Image.fromarray(frame_rgb)
 
-        idxs, probs = predict(model, pil, transform, device, top_k)
+        # On passe intensity et threshold dynamiquement (optionnel)
+        idxs, probs, gradcam_viz, best_idx, best_prob = predict_and_explain(
+            model, pil_image, transform, device, cam, top_k
+        )
 
-        best_idx = int(idxs[0])
-        best_prob = float(probs[0])
-        sku = mapping[best_idx]
-
+        sku = mapping.get(best_idx, "Inconnu")
         frame_out = draw_result(frame_rgb, sku, best_prob)
 
-        frame_placeholder.image(frame_out, use_container_width=True)
+        if show_gradcam:
+            h, w = frame_out.shape[:2]
+            gradcam_resized = cv2.resize(gradcam_viz, (w, h))
+            combined = np.hstack((frame_out, gradcam_resized))
+            frame_placeholder.image(combined, channels="RGB", 
+                                   caption=f"{sku} | {cam_type} | High Contrast", 
+                                   use_container_width=True)
+        else:
+            frame_placeholder.image(frame_out, channels="RGB", caption=sku, use_container_width=True)
 
     cap.release()
-    st.success("Caméra arrêtée")
+    st.success("Caméra arrêtée.")
